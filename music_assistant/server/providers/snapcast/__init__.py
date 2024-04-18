@@ -8,6 +8,7 @@ import pathlib
 import random
 import socket
 import time
+import uuid
 from contextlib import suppress
 from typing import TYPE_CHECKING, Final, cast
 
@@ -36,7 +37,11 @@ from music_assistant.common.models.enums import (
 from music_assistant.common.models.errors import SetupFailedError
 from music_assistant.common.models.media_items import AudioFormat
 from music_assistant.common.models.player import DeviceInfo, Player, PlayerMedia
-from music_assistant.server.helpers.audio import FFMpeg, get_ffmpeg_stream, get_player_filter_params
+from music_assistant.server.helpers.audio import (
+    FFMpeg,
+    get_ffmpeg_stream,
+    get_player_filter_params,
+)
 from music_assistant.server.helpers.process import AsyncProcess, check_output
 from music_assistant.server.models.player_provider import PlayerProvider
 
@@ -138,6 +143,7 @@ class SnapCastProvider(PlayerProvider):
     _snapcast_server_host: str
     _snapcast_server_control_port: int
     _stream_tasks: dict[str, asyncio.Task]
+    _snap_client_map: TwoWay[str, str]
     _use_builtin_server: bool
     _snapserver_runner: asyncio.Task | None
     _snapserver_started = asyncio.Event | None
@@ -160,6 +166,7 @@ class SnapCastProvider(PlayerProvider):
             self._snapcast_server_control_port = self.config.get_value(CONF_SERVER_CONTROL_PORT)
 
         self._stream_tasks = {}
+        self._snap_client_map = TwoWay()
 
         if self._use_builtin_server:
             # start our own builtin snapserver
@@ -249,32 +256,28 @@ class SnapCastProvider(PlayerProvider):
 
     def _handle_player_update(self, snap_client: Snapclient) -> None:
         """Process Snapcast update to Player controller."""
-        player_id = snap_client.identifier
-        player = self.mass.players.get(player_id)
+        internal_player_id = self._get_internal_player_id(snap_client.identifier)
+        player = self.mass.players.get(internal_player_id)
         player.name = snap_client.friendly_name
         player.volume_level = snap_client.volume
         player.volume_muted = snap_client.muted
         player.available = snap_client.connected
-        player.can_sync_with = tuple(
-            x.identifier
-            for x in self._snapserver.clients
-            if x.identifier != player_id and x.connected
-        )
-        player.synced_to = self._synced_to(player_id)
-        player.group_childs = self._group_childs(player_id)
+        player.can_sync_with = self._can_sync_with(internal_player_id)
+        player.synced_to = self._synced_to(internal_player_id)
+        player.group_childs = self._group_childs(internal_player_id)
         if player.active_group is None:
-            if stream := self._get_snapstream(player_id):
+            if stream := self._get_snapstream(internal_player_id):
                 if stream.name.startswith(("MusicAssistant", "default")):
-                    player.active_source = player_id
+                    player.active_source = internal_player_id
                 else:
                     player.active_source = stream.name
             else:
-                player.active_source = player_id
+                player.active_source = internal_player_id
         self.mass.players.register_or_update(player)
 
-    async def get_player_config_entries(self, player_id: str) -> tuple[ConfigEntry]:
+    async def get_player_config_entries(self, internal_player_id: str) -> tuple[ConfigEntry]:
         """Return all (provider/player specific) Config Entries for the given player (if any)."""
-        base_entries = await super().get_player_config_entries(player_id)
+        base_entries = await super().get_player_config_entries(internal_player_id)
         return (
             *base_entries,
             CONF_ENTRY_FLOW_MODE_ENFORCED,
@@ -404,29 +407,31 @@ class SnapCastProvider(PlayerProvider):
         # start streaming the queue (pcm) audio in a background task
         self._stream_tasks[player_id] = asyncio.create_task(_streamer())
 
-    def _get_snapgroup(self, player_id: str) -> Snapgroup:
+    def _get_snapgroup(self, internal_player_id: str) -> Snapgroup:
         """Get snapcast group for given player_id."""
-        client: Snapclient = self._snapserver.client(player_id)
+        client: Snapclient = self._snapserver.client(self._get_snapclient_id(internal_player_id))
         return client.group
 
-    def _get_snapstream(self, player_id: str) -> Snapstream | None:
+    def _get_snapstream(self, internal_player_id: str) -> Snapstream | None:
         """Get snapcast stream for given player_id."""
-        if group := self._get_snapgroup(player_id):
+        if group := self._get_snapgroup(self._get_snapclient_id(internal_player_id)):
             with suppress(KeyError):
                 return self._snapserver.stream(group.stream)
         return None
 
-    def _synced_to(self, player_id: str) -> str | None:
+    def _synced_to(self, internal_player_id: str) -> str | None:
         """Return player_id of the player this player is synced to."""
-        snap_group = self._get_snapgroup(player_id)
-        if player_id != snap_group.clients[0]:
+        snap_group = self._get_snapgroup(internal_player_id)
+        if internal_player_id != snap_group.clients[0]:
             return snap_group.clients[0]
         return None
 
-    def _group_childs(self, player_id: str) -> set[str]:
+    def _group_childs(self, internal_player_id: str) -> set[str]:
         """Return player_ids of the players synced to this player."""
-        snap_group = self._get_snapgroup(player_id)
-        return {snap_client for snap_client in snap_group.clients if snap_client != player_id}
+        snap_group = self._get_snapgroup(internal_player_id)
+        return {
+            snap_client for snap_client in snap_group.clients if snap_client != internal_player_id
+        }
 
     async def _create_stream(self) -> tuple[Snapstream, int]:
         """Create new stream on snapcast server."""
@@ -450,9 +455,9 @@ class SnapCastProvider(PlayerProvider):
         msg = "Unable to create stream - No free port found?"
         raise RuntimeError(msg)
 
-    def _get_player_state(self, player_id: str) -> PlayerState:
+    def _get_player_state(self, internal_player_id: str) -> PlayerState:
         """Return the state of the player."""
-        snap_group = self._get_snapgroup(player_id)
+        snap_group = self._get_snapgroup(internal_player_id)
         return SNAP_STREAM_STATUS_MAP.get(snap_group.stream_status)
 
     def _set_childs_state(self, player_id: str, state: PlayerState) -> None:
@@ -461,6 +466,27 @@ class SnapCastProvider(PlayerProvider):
             player = self.mass.players.get(child_player_id)
             player.state = state
             self.mass.players.update(child_player_id)
+
+    def _get_internal_player_id(self, snap_client_id: str) -> str:
+        """Return the internal player_id for a given snap_client_id."""
+        internal_id = self._snap_client_map.get(snap_client_id)
+        if internal_id is None:
+            internal_id = str(uuid.uuid4())
+            self._snap_client_map.add(snap_client_id, internal_id)
+        return internal_id
+
+    def _get_snapclient_id(self, internal_player_id: str) -> str:
+        """Return the snap_client_id for a given internal player_id."""
+        return self._snap_client_map.get(internal_player_id)
+
+    def can_sync_with(self, internal_player_id: str) -> set[str]:
+        """Return set of player_ids that can be synced with the given player."""
+        snap_client_id = self._get_snapclient_id(internal_player_id)
+        return tuple(
+            self._get_internal_player_id(x.identifier)
+            for x in self._snapserver.clients
+            if x.identifier != snap_client_id and x.connected
+        )
 
     async def _builtin_server_runner(self) -> None:
         """Start running the builtin snapserver."""
@@ -494,7 +520,8 @@ class SnapCastProvider(PlayerProvider):
                 setattr(self, attr_name, True)
             except NonUniqueNameException:
                 self.logger.debug(
-                    "Could not register mdns record for %s as its already in use", zeroconf_type
+                    "Could not register mdns record for %s as its already in use",
+                    zeroconf_type,
                 )
             except Exception as err:
                 self.logger.exception(
@@ -521,3 +548,24 @@ class SnapCastProvider(PlayerProvider):
                         # delay init a small bit to prevent race conditions
                         # where we try to connect too soon
                         self.mass.loop.call_later(2, self._snapserver_started.set)
+
+
+class TwoWay:
+    """Two way dict to map snapclient_id to internal player_id."""
+
+    def __init__(self):
+        """Two way dict to map snapclient_id to internal player_id."""
+        self.d = {}
+
+    def add(self, k: str, v: str):
+        """Add a new mapping."""
+        self.d[k] = v
+        self.d[v] = k
+
+    def remove(self, k: str):
+        """Remove a mapping."""
+        self.d.pop(self.d.pop(k))
+
+    def get(self, k: str) -> str | None:
+        """Get the value for a key."""
+        return self.d[k]
